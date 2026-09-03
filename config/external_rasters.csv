@@ -1,0 +1,2 @@
+covariate_name,gee_asset_id,buffer_mode,reducer,scale_m,enabled,notes
+fruit_tree_suitability,,nonscaled,mean,1000,false,Upload local rasters to Earth Engine as assets and add the asset ID here.

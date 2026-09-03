@@ -1,0 +1,834 @@
+---
+title: "Interactive Event Prediction Report"
+author: "Event ENM workflow"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 11,
+  fig.height = 3.75,
+  dpi = 150,
+  out.width = "100%"
+)
+
+required_packages <- c("leaflet", "terra", "htmltools", "htmlwidgets", "ggplot2")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop("Install required packages before knitting this report: ", paste(missing_packages, collapse = ", "), call. = FALSE)
+}
+
+library(leaflet)
+library(htmltools)
+library(ggplot2)
+
+get_current_script_path <- function() {
+  command_args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", command_args, value = TRUE)
+  if (length(file_arg) > 0) {
+    return(normalizePath(sub("^--file=", "", file_arg[1]), winslash = "/", mustWork = TRUE))
+  }
+
+  for (frame in rev(sys.frames())) {
+    if (!is.null(frame$ofile)) {
+      return(normalizePath(frame$ofile, winslash = "/", mustWork = TRUE))
+    }
+  }
+
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    active_doc <- tryCatch(rstudioapi::getActiveDocumentContext()$path, error = function(e) NA_character_)
+    if (!is.na(active_doc) && nzchar(active_doc)) {
+      return(normalizePath(active_doc, winslash = "/", mustWork = TRUE))
+    }
+  }
+
+  NA_character_
+}
+
+find_code_dir <- function() {
+  script_path <- get_current_script_path()
+  wd <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+  script_dir <- if (!is.na(script_path)) dirname(script_path) else NA_character_
+  wd_parents <- normalizePath(
+    file.path(wd, c(".", "..", "../..", "../../..")),
+    winslash = "/",
+    mustWork = FALSE
+  )
+  script_candidates <- if (!is.na(script_dir)) {
+    normalizePath(
+      file.path(script_dir, c(".", "..", "../..")),
+      winslash = "/",
+      mustWork = FALSE
+    )
+  } else {
+    character(0)
+  }
+
+  candidates <- c(
+    script_candidates,
+    wd_parents,
+    file.path(wd_parents, "KSPH Code")
+  )
+
+  candidates <- unique(normalizePath(candidates, winslash = "/", mustWork = FALSE))
+  for (candidate in candidates) {
+    if (
+      file.exists(file.path(candidate, "config", "predictor_list.csv")) &&
+      dir.exists(file.path(candidate, "R_python_code"))
+    ) {
+      return(candidate)
+    }
+  }
+
+  stop(
+    "Could not locate the KSPH Code repo root. Knit this report from inside the KSPH Code project, ",
+    "or set CODE_DIR manually near the top of 04b_interactive_prediction_report_email.Rmd.",
+    call. = FALSE
+  )
+}
+
+CODE_DIR <- find_code_dir()
+PREDICTION_DIR <- file.path(CODE_DIR, "outputs", "predictions")
+MODEL_DIAGNOSTIC_DIR <- file.path(CODE_DIR, "outputs", "model_diagnostics")
+SHAP_CHANGE_TABLE_CSV <- file.path(
+  PREDICTION_DIR,
+  "shap",
+  "tables",
+  "prediction_grid_mean_shap_changes_2021_2025.csv"
+)
+
+PREDICTION_YEARS <- 2020:2025
+CHANGE_YEARS <- 2021:2025
+RASTER_CRS <- "EPSG:4326"
+TOP_PERCENTILE <- 0.99
+MAP_OPACITY_VALUE <- 0.72
+MAP_OPACITY_TOP1 <- 0.92
+LEAFLET_MAP_HEIGHT <- "300px"
+LEAFLET_NA_COLOR <- "#00000000"
+
+ROR_BREAKPOINTS <- c(0.4, 0.7, 1.5, 5, 15)
+CHANGE_RATIO_BREAKPOINTS <- c(0.6, 0.8, 1.2, 1.6, 2)
+ROR_VALUE_COLORS <- c("green4", "lightgreen", "white", "red", "darkred", "purple4")
+CHANGE_RATIO_VALUE_COLORS <- c("blue3", "lightblue", "white", "orange1", "red2", "red4")
+TOP_PERCENTILE_COLOR <- "red"
+
+raster_cache <- new.env(parent = emptyenv())
+
+event_report_products <- list(
+  ror = list(
+    label = "Relative odds ratio",
+    years = PREDICTION_YEARS,
+    year_label = function(year) as.character(year),
+    raster_path = function(year) {
+      file.path(PREDICTION_DIR, "ROR estimates", sprintf("event_probability_ROR_%s.tif", year))
+    },
+    value_layer = "ROR_mean",
+    top_layer = "ROR_mean_top1pct",
+    breakpoints = ROR_BREAKPOINTS,
+    colors = ROR_VALUE_COLORS,
+    legend_title = "Mean ROR",
+    top_legend_title = "Top 1% ROR"
+  ),
+  ror_change = list(
+    label = "1-year ROR ratio",
+    years = CHANGE_YEARS,
+    year_label = function(year) sprintf("%s / %s", year, year - 1),
+    raster_path = function(year) {
+      file.path(PREDICTION_DIR, "ROR 1yr ratios", sprintf("chgROR_1yr_%s_over_%s.tif", year, year - 1))
+    },
+    value_layer = "chgROR_1yr_mean",
+    top_layer = "chgROR_1yr_mean_top1pct",
+    breakpoints = CHANGE_RATIO_BREAKPOINTS,
+    colors = CHANGE_RATIO_VALUE_COLORS,
+    legend_title = "Mean ratio",
+    top_legend_title = "Top 1% ratios"
+  )
+)
+
+available_years <- function(product) {
+  product$years[vapply(product$years, function(year) file.exists(product$raster_path(year)), logical(1))]
+}
+
+required_product_years <- lapply(event_report_products, available_years)
+missing_products <- names(required_product_years)[vapply(required_product_years, length, integer(1)) == 0]
+if (length(missing_products) > 0) {
+  stop(
+    "No raster files were found for report product(s): ",
+    paste(missing_products, collapse = ", "),
+    ". Run the derived raster sections in 03_train_predict_brt_simple.R first.",
+    call. = FALSE
+  )
+}
+
+pretty_legend_value <- function(value) {
+  formatted <- format(signif(value, 3), scientific = FALSE, trim = TRUE)
+  sub("\\.?0+$", "", formatted)
+}
+
+discrete_break_labels <- function(breaks) {
+  if (length(breaks) < 2) {
+    return(character(0))
+  }
+
+  labels <- character(length(breaks) - 1)
+  for (i in seq_along(labels)) {
+    lower <- pretty_legend_value(breaks[i])
+    upper <- pretty_legend_value(breaks[i + 1])
+    if (i == 1) {
+      labels[i] <- paste0("<", upper)
+    } else if (i == length(labels)) {
+      labels[i] <- paste0(lower, "+")
+    } else {
+      labels[i] <- paste0(lower, "-", upper)
+    }
+  }
+  labels
+}
+
+raster_numeric_values <- function(raster_layer) {
+  raw_values <- terra::values(raster_layer)
+  if (is.data.frame(raw_values)) {
+    raw_values <- raw_values[[1]]
+  } else if (is.matrix(raw_values)) {
+    raw_values <- raw_values[, 1]
+  } else if (is.list(raw_values)) {
+    raw_values <- raw_values[[1]]
+  }
+
+  suppressWarnings(as.numeric(raw_values))
+}
+
+layer_values <- function(raster_layer) {
+  values <- raster_numeric_values(raster_layer)
+  values[is.finite(values)]
+}
+
+cache_key <- function(product_id, year) {
+  paste(product_id, year, sep = "_")
+}
+
+read_product_raster <- function(product_id, year) {
+  key <- cache_key(product_id, year)
+  if (exists(key, envir = raster_cache, inherits = FALSE)) {
+    return(get(key, envir = raster_cache, inherits = FALSE))
+  }
+
+  product <- event_report_products[[product_id]]
+  raster_path <- product$raster_path(year)
+  if (!file.exists(raster_path)) {
+    stop("Raster file does not exist: ", raster_path, call. = FALSE)
+  }
+
+  raster_stack <- terra::rast(raster_path)
+  raster_crs <- terra::crs(raster_stack)
+  if (is.na(raster_crs) || !nzchar(raster_crs)) {
+    terra::crs(raster_stack) <- RASTER_CRS
+  }
+
+  assign(key, raster_stack, envir = raster_cache)
+  raster_stack
+}
+
+make_top_percentile_layer <- function(value_layer, top_layer_name) {
+  values <- layer_values(value_layer)
+  if (length(values) == 0) {
+    top_layer <- value_layer * NA_real_
+  } else {
+    threshold <- as.numeric(stats::quantile(values, probs = TOP_PERCENTILE, na.rm = TRUE, names = FALSE))
+    top_layer <- terra::ifel(value_layer >= threshold, 1, NA_real_)
+  }
+
+  names(top_layer) <- top_layer_name
+  top_layer
+}
+
+read_report_layer <- function(product_id, year, display_mode) {
+  product <- event_report_products[[product_id]]
+  raster_stack <- read_product_raster(product_id, year)
+
+  if (display_mode == "value") {
+    if (!product$value_layer %in% names(raster_stack)) {
+      stop("Layer '", product$value_layer, "' was not found in ", product$raster_path(year), call. = FALSE)
+    }
+    return(raster_stack[[product$value_layer]])
+  }
+
+  if (product$top_layer %in% names(raster_stack)) {
+    top_layer <- raster_stack[[product$top_layer]]
+    top_layer <- terra::ifel(top_layer >= 1, 1, NA_real_)
+    names(top_layer) <- product$top_layer
+    return(top_layer)
+  }
+
+  if (!product$value_layer %in% names(raster_stack)) {
+    stop("Layer '", product$value_layer, "' was not found in ", product$raster_path(year), call. = FALSE)
+  }
+  make_top_percentile_layer(raster_stack[[product$value_layer]], product$top_layer)
+}
+
+product_value_bins <- function(product_id) {
+  product <- event_report_products[[product_id]]
+  values <- unlist(
+    lapply(available_years(product), function(year) {
+      layer_values(read_report_layer(product_id, year, "value"))
+    }),
+    use.names = FALSE
+  )
+
+  if (length(values) == 0) {
+    return(c(0, 1))
+  }
+
+  min_value <- min(values, na.rm = TRUE)
+  max_value <- max(values, na.rm = TRUE)
+  if (min_value == max_value) {
+    pad <- max(abs(min_value) * 0.05, 1e-6)
+    return(c(min_value - pad, max_value + pad))
+  }
+
+  breaks <- sort(unique(c(
+    min_value,
+    product$breakpoints[product$breakpoints > min_value & product$breakpoints < max_value],
+    max_value
+  )))
+  if (length(breaks) < 2) {
+    pad <- max(abs(min_value) * 0.05, 1e-6)
+    breaks <- c(min_value - pad, max_value + pad)
+  }
+
+  breaks
+}
+
+fit_product_bounds <- function(map, product_id) {
+  product <- event_report_products[[product_id]]
+  first_year <- available_years(product)[1]
+  raster_layer <- read_report_layer(product_id, first_year, "value")
+  extent <- terra::ext(raster_layer)
+
+  leaflet::fitBounds(
+    map,
+    lng1 = terra::xmin(extent),
+    lat1 = terra::ymin(extent),
+    lng2 = terra::xmax(extent),
+    lat2 = terra::ymax(extent)
+  )
+}
+
+diagnostic_file_path <- function(file_name) {
+  path <- file.path(MODEL_DIAGNOSTIC_DIR, file_name)
+  if (!file.exists(path)) {
+    stop(
+      "Could not find model diagnostic file: ", path,
+      ". Run the relative-importance and marginal-effect sections in 03_train_predict_brt_simple.R first.",
+      call. = FALSE
+    )
+  }
+  path
+}
+
+display_covariate_name <- function(predictor) {
+  scale_match <- regexpr("_[0-9]+_[0-9]+km$", predictor)
+  scale <- if (scale_match[1] == -1) "" else regmatches(predictor, scale_match)
+  scale_label <- ifelse(
+    nzchar(scale),
+    paste0(" (", gsub("_", "-", sub("^_", "", scale)), ")"),
+    ""
+  )
+  base_name <- sub("_[0-9]+_[0-9]+km$", "", predictor)
+
+  base_labels <- c(
+    forest_cover_prop = "Forest cover",
+    frag_edge_prop = "Forest edge",
+    flsy_prop = "Forest loss, same yr",
+    fl1yp_prop = "Forest loss, 1-yr lag",
+    fl2yp_prop = "Forest loss, 2-yr lag",
+    pop_density = "Population density",
+    precip_mm = "Precipitation",
+    precip_anom_mm = "Precip. anomaly",
+    precip_z = "Precip. z-score",
+    temp_c = "Temperature",
+    temp_anom_c = "Temp. anomaly",
+    temp_z = "Temp. z-score",
+    pet_mm = "PET",
+    ndvi = "NDVI",
+    ndvi_anom = "NDVI anomaly",
+    ndvi_z = "NDVI z-score",
+    elevation_m = "Elevation"
+  )
+
+  label <- unname(base_labels[base_name])
+  if (is.na(label)) {
+    label <- tools::toTitleCase(gsub("_", " ", base_name))
+  }
+
+  paste0(label, scale_label)
+}
+
+read_relative_importance_tables <- function() {
+  importance_long <- utils::read.csv(
+    diagnostic_file_path("brt_relative_importance_by_model.csv"),
+    stringsAsFactors = FALSE
+  )
+  importance_summary <- utils::read.csv(
+    diagnostic_file_path("brt_relative_importance_summary.csv"),
+    stringsAsFactors = FALSE
+  )
+
+  importance_summary <- importance_summary[order(-importance_summary$median, importance_summary$predictor), , drop = FALSE]
+  ordered_predictors <- importance_summary$predictor
+  ordered_labels <- vapply(ordered_predictors, display_covariate_name, character(1))
+
+  importance_long$predictor_label <- vapply(importance_long$predictor, display_covariate_name, character(1))
+  importance_long$predictor_label <- factor(importance_long$predictor_label, levels = rev(ordered_labels))
+  importance_summary$predictor_label <- factor(ordered_labels, levels = rev(ordered_labels))
+
+  list(long = importance_long, summary = importance_summary)
+}
+
+plot_report_relative_importance <- function() {
+  importance <- read_relative_importance_tables()
+
+  ggplot(importance$long, aes(x = predictor_label, y = rel_inf)) +
+    geom_boxplot(
+      fill = "gray88",
+      color = "gray25",
+      outlier.alpha = 0.25,
+      outlier.size = 0.8,
+      linewidth = 0.35
+    ) +
+    coord_flip() +
+    labs(
+      x = NULL,
+      y = "Relative importance (%)",
+      title = "BRT Relative Importance Across Model Fits"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0),
+      axis.text.y = element_text(size = 10),
+      axis.text.x = element_text(size = 11),
+      axis.title.x = element_text(size = 13, margin = margin(t = 8)),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(8, 18, 8, 8)
+    )
+}
+
+read_marginal_effect_curves <- function() {
+  curve_table <- utils::read.csv(
+    diagnostic_file_path("brt_marginal_effect_curves_top16.csv"),
+    stringsAsFactors = FALSE
+  )
+  importance <- read_relative_importance_tables()$summary
+  ordered_predictors <- as.character(importance$predictor[importance$predictor %in% unique(curve_table$predictor)])
+  ordered_labels <- vapply(ordered_predictors, display_covariate_name, character(1))
+
+  curve_table$predictor_label <- vapply(curve_table$predictor, display_covariate_name, character(1))
+  curve_table$predictor_label <- factor(curve_table$predictor_label, levels = ordered_labels)
+  curve_table <- curve_table[!is.na(curve_table$predictor_label), , drop = FALSE]
+  curve_table
+}
+
+plot_report_marginal_effect_curves <- function() {
+  curve_table <- read_marginal_effect_curves()
+  average_curves <- stats::aggregate(
+    y ~ predictor_label + x,
+    data = curve_table,
+    FUN = mean
+  )
+
+  ggplot(curve_table, aes(x = x, y = y)) +
+    geom_line(aes(group = model_id), color = "steelblue4", alpha = 0.14, linewidth = 0.25) +
+    geom_line(data = average_curves, color = "black", linewidth = 0.85) +
+    facet_wrap(~ predictor_label, scales = "free_x", ncol = 4) +
+    labs(
+      x = NULL,
+      y = "Partial effect",
+      title = "Marginal Response Curves For Top 16 Variables"
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0),
+      strip.background = element_rect(fill = "gray95", color = "gray60"),
+      strip.text = element_text(size = 10, face = "bold"),
+      axis.text = element_text(size = 8),
+      axis.title.y = element_text(size = 12, margin = margin(r = 8)),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(8, 12, 8, 8)
+    )
+}
+
+read_shap_change_summary_columns <- function() {
+  if (!file.exists(SHAP_CHANGE_TABLE_CSV)) {
+    return(NULL)
+  }
+
+  header <- names(utils::read.csv(SHAP_CHANGE_TABLE_CSV, nrows = 0, check.names = FALSE))
+  top_columns <- unlist(lapply(seq_len(5), function(rank_id) {
+    c(
+      sprintf("top_shap_change_%s_predictor", rank_id),
+      sprintf("top_shap_change_%s_label", rank_id),
+      sprintf("top_shap_change_%s_value", rank_id)
+    )
+  }))
+  keep_columns <- c(
+    "longitude",
+    "latitude",
+    "x",
+    "y",
+    "grid_id",
+    "country",
+    "year",
+    "previous_year",
+    "pred_mean",
+    "pred_mean_previous",
+    "pred_mean_change",
+    "pred_mean_ratio",
+    top_columns
+  )
+  col_classes <- ifelse(header %in% keep_columns, NA, "NULL")
+
+  utils::read.csv(
+    SHAP_CHANGE_TABLE_CSV,
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    colClasses = col_classes
+  )
+}
+
+plot_report_shap_driver_counts <- function() {
+  shap_changes <- read_shap_change_summary_columns()
+  if (is.null(shap_changes)) {
+    graphics::plot.new()
+    graphics::text(
+      0.5,
+      0.5,
+      "SHAP change table has not been created yet.\nRun the SHAP section in 03_train_predict_brt_simple.R, then knit this report again.",
+      cex = 1.1
+    )
+    return(invisible(NULL))
+  }
+
+  shap_changes <- shap_changes[
+    is.finite(shap_changes$pred_mean_change) &
+      shap_changes$pred_mean_change > 0 &
+      !is.na(shap_changes$top_shap_change_1_label) &
+      nzchar(shap_changes$top_shap_change_1_label),
+    ,
+    drop = FALSE
+  ]
+  if (nrow(shap_changes) == 0) {
+    graphics::plot.new()
+    graphics::text(0.5, 0.5, "No positive prediction changes were available for SHAP driver summaries.", cex = 1.1)
+    return(invisible(NULL))
+  }
+
+  count_table <- as.data.frame(table(
+    year = shap_changes$year,
+    driver = shap_changes$top_shap_change_1_label
+  ))
+  count_table <- count_table[count_table$Freq > 0, , drop = FALSE]
+  names(count_table)[names(count_table) == "Freq"] <- "count"
+
+  driver_totals <- stats::aggregate(count ~ driver, data = count_table, FUN = sum)
+  driver_totals <- driver_totals[order(-driver_totals$count), , drop = FALSE]
+  keep_drivers <- head(driver_totals$driver, 12)
+  count_table <- count_table[count_table$driver %in% keep_drivers, , drop = FALSE]
+  count_table$driver <- factor(count_table$driver, levels = rev(keep_drivers))
+
+  ggplot(count_table, aes(x = driver, y = count)) +
+    geom_col(fill = "steelblue4", width = 0.75) +
+    coord_flip() +
+    facet_wrap(~ year, ncol = 1, scales = "free_y") +
+    labs(
+      x = NULL,
+      y = "Pixel-year count",
+      title = "Most Common Primary SHAP Drivers Among Increasing Predictions"
+    ) +
+    theme_bw(base_size = 13) +
+    theme(
+      plot.title = element_text(size = 18, face = "bold", hjust = 0),
+      strip.background = element_rect(fill = "gray95", color = "gray60"),
+      strip.text = element_text(size = 12, face = "bold"),
+      axis.text.y = element_text(size = 10),
+      axis.text.x = element_text(size = 10),
+      panel.grid.major.y = element_blank(),
+      panel.grid.minor = element_blank(),
+      plot.margin = margin(8, 18, 8, 8)
+    )
+}
+
+render_report_shap_largest_changes <- function(n = 20) {
+  shap_changes <- read_shap_change_summary_columns()
+  if (is.null(shap_changes)) {
+    cat("SHAP change table has not been created yet. Run the SHAP section in `03_train_predict_brt_simple.R`, then knit this report again.")
+    return(invisible(NULL))
+  }
+
+  shap_changes <- shap_changes[is.finite(shap_changes$pred_mean_change), , drop = FALSE]
+  shap_changes <- shap_changes[order(-shap_changes$pred_mean_change), , drop = FALSE]
+  shap_changes <- head(shap_changes, n)
+
+  out <- data.frame(
+    year = shap_changes$year,
+    country = shap_changes$country,
+    longitude = round(shap_changes$longitude, 3),
+    latitude = round(shap_changes$latitude, 3),
+    pred_change = signif(shap_changes$pred_mean_change, 3),
+    top_1 = paste0(shap_changes$top_shap_change_1_label, " (", signif(shap_changes$top_shap_change_1_value, 3), ")"),
+    top_2 = paste0(shap_changes$top_shap_change_2_label, " (", signif(shap_changes$top_shap_change_2_value, 3), ")"),
+    top_3 = paste0(shap_changes$top_shap_change_3_label, " (", signif(shap_changes$top_shap_change_3_value, 3), ")"),
+    top_4 = paste0(shap_changes$top_shap_change_4_label, " (", signif(shap_changes$top_shap_change_4_value, 3), ")"),
+    top_5 = paste0(shap_changes$top_shap_change_5_label, " (", signif(shap_changes$top_shap_change_5_value, 3), ")"),
+    check.names = FALSE
+  )
+
+  knitr::kable(
+    out,
+    row.names = FALSE,
+    caption = paste("Largest", n, "mean prediction increases and their top SHAP-change drivers")
+  )
+}
+
+enforce_single_active_overlay <- function(map, overlay_groups, default_group) {
+  htmlwidgets::onRender(
+    map,
+    "
+    function(el, x, data) {
+      var map = this;
+      var overlayGroups = data.overlayGroups || [];
+      var defaultGroup = data.defaultGroup;
+      var activeGroup = defaultGroup;
+      var radioName = el.id + '-exclusive-year-overlay';
+
+      function normalizeLabel(value) {
+        return (value || '').replace(/\\s+/g, ' ').trim();
+      }
+
+      function makeOverlayControlsRadio() {
+        var overlayPane = el.querySelector('.leaflet-control-layers-overlays');
+        if (!overlayPane) {
+          return;
+        }
+
+        overlayPane.querySelectorAll('label').forEach(function(label) {
+          var input = label.querySelector('input');
+          var groupName = normalizeLabel(label.textContent);
+          if (!input || overlayGroups.indexOf(groupName) === -1) {
+            return;
+          }
+
+          input.type = 'radio';
+          input.name = radioName;
+          input.checked = groupName === activeGroup;
+        });
+      }
+
+      setTimeout(makeOverlayControlsRadio, 0);
+      map.on('overlayadd', function(event) {
+        if (overlayGroups.indexOf(event.name) !== -1) {
+          activeGroup = event.name;
+        }
+        setTimeout(makeOverlayControlsRadio, 0);
+      });
+      map.on('overlayremove', function(event) {
+        if (event.name === activeGroup) {
+          activeGroup = defaultGroup;
+        }
+        setTimeout(makeOverlayControlsRadio, 0);
+      });
+    }
+    ",
+    data = list(
+      overlayGroups = unname(overlay_groups),
+      defaultGroup = unname(default_group)
+    )
+  )
+}
+
+make_layered_report_map <- function(product_id, display_mode) {
+  product <- event_report_products[[product_id]]
+  years <- available_years(product)
+  overlay_groups <- vapply(years, product$year_label, character(1))
+  default_group <- overlay_groups[length(overlay_groups)]
+
+  map <- leaflet::leaflet(options = leaflet::leafletOptions(preferCanvas = TRUE)) |>
+    leaflet::addProviderTiles(leaflet::providers$Esri.WorldTopoMap, group = "Topo") |>
+    leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron, group = "Light") |>
+    leaflet::addScaleBar(position = "bottomleft")
+
+  if (display_mode == "value") {
+    bins <- product_value_bins(product_id)
+    legend_labels <- discrete_break_labels(bins)
+    colors <- grDevices::colorRampPalette(product$colors)(length(legend_labels))
+    finite_values <- unlist(
+      lapply(years, function(year) layer_values(read_report_layer(product_id, year, "value"))),
+      use.names = FALSE
+    )
+    palette <- leaflet::colorBin(
+      palette = colors,
+      bins = bins,
+      domain = finite_values,
+      na.color = LEAFLET_NA_COLOR
+    )
+
+    for (i in seq_along(years)) {
+      map <- leaflet::addRasterImage(
+        map,
+        read_report_layer(product_id, years[i], "value"),
+        colors = palette,
+        opacity = MAP_OPACITY_VALUE,
+        project = TRUE,
+        maxBytes = 50 * 1024 * 1024,
+        group = overlay_groups[i]
+      )
+    }
+
+    map <- map |>
+      leaflet::addLegend(
+        position = "bottomleft",
+        colors = rev(colors),
+        labels = rev(legend_labels),
+        title = product$legend_title,
+        opacity = MAP_OPACITY_VALUE
+      )
+  } else {
+    palette <- leaflet::colorBin(
+      palette = TOP_PERCENTILE_COLOR,
+      bins = c(0.5, 1.5),
+      domain = c(1),
+      na.color = LEAFLET_NA_COLOR
+    )
+
+    for (i in seq_along(years)) {
+      map <- leaflet::addRasterImage(
+        map,
+        read_report_layer(product_id, years[i], "top"),
+        colors = palette,
+        opacity = MAP_OPACITY_TOP1,
+        project = TRUE,
+        maxBytes = 50 * 1024 * 1024,
+        group = overlay_groups[i]
+      )
+    }
+
+    map <- map |>
+      leaflet::addLegend(
+        position = "bottomleft",
+        colors = TOP_PERCENTILE_COLOR,
+        labels = "Top 1%",
+        title = product$top_legend_title,
+        opacity = MAP_OPACITY_TOP1
+      )
+  }
+
+  map |>
+    leaflet::addLayersControl(
+      baseGroups = c("Topo", "Light"),
+      overlayGroups = overlay_groups,
+      options = leaflet::layersControlOptions(collapsed = FALSE)
+    ) |>
+    leaflet::hideGroup(setdiff(overlay_groups, default_group)) |>
+    fit_product_bounds(product_id) |>
+    enforce_single_active_overlay(overlay_groups, default_group)
+}
+```
+
+```{css, echo=FALSE}
+.main-container {
+  max-width: 1800px !important;
+  width: 98% !important;
+}
+
+.section-note {
+  max-width: 1300px;
+  font-size: 1.05rem;
+  line-height: 1.45;
+  margin-bottom: 1rem;
+}
+
+.leaflet {
+  border: 1px solid #cccccc;
+  margin-bottom: 1.5rem;
+}
+```
+
+This static HTML report reads the GeoTIFF rasters generated by `03_train_predict_brt_simple.R` and embeds interactive Leaflet maps. Each map includes year-specific overlays that can be activated or deactivated in the layer control. The map overlays are packaged into the knitted HTML file, but the basemap tiles still require an internet connection when the recipient opens the report.
+
+## Overall Relative Odds Ratio Predictions
+
+<div class="section-note">
+These maps show the mean relative odds ratio (ROR) for each prediction-grid cell. A value above 1 means the estimated odds for that cell-year are higher than the study-area average odds for the same year.
+</div>
+
+### Mean ROR
+
+```{r ror-value-map}
+make_layered_report_map("ror", "value")
+```
+
+### Top 1% Mean ROR
+
+```{r ror-top-map}
+make_layered_report_map("ror", "top")
+```
+
+## 1-Year Change In Relative Odds Ratios
+
+<div class="section-note">
+These maps show the ratio of the current year's mean ROR to the previous year's mean ROR for the same cell. Values above 1 indicate an increase relative to the prior year; values below 1 indicate a decrease.
+</div>
+
+### Mean 1-Year ROR Ratio
+
+```{r ror-change-value-map}
+make_layered_report_map("ror_change", "value")
+```
+
+### Top 1% Mean 1-Year ROR Ratios
+
+```{r ror-change-top-map}
+make_layered_report_map("ror_change", "top")
+```
+
+## Relative Importance
+
+<div class="section-note">
+This plot summarizes relative importance across the fitted BRT model ensemble. Variables are ordered by median relative importance, with each box showing the distribution across model fits.
+</div>
+
+```{r relative-importance-plot, fig.width=14, fig.height=10.5}
+plot_report_relative_importance()
+```
+
+## Marginal Response Curves
+
+<div class="section-note">
+These plots show marginal response curves for the 16 variables with the highest median relative importance. The transparent blue lines are individual model fits, and the black line is the average curve across the ensemble.
+</div>
+
+```{r marginal-response-curves, fig.width=14, fig.height=12}
+plot_report_marginal_effect_curves()
+```
+
+## SHAP Drivers Of Prediction Changes
+
+<div class="section-note">
+These summaries use mean TreeSHAP values from the fitted BRT ensemble to describe which covariates most strongly explain year-to-year changes in predictions. SHAP values are additive on the model's log-odds scale, so a positive SHAP change means that covariate pushed the selected pixel-year prediction upward relative to the previous year.
+</div>
+
+```{r shap-driver-counts, fig.width=14, fig.height=12}
+plot_report_shap_driver_counts()
+```
+
+```{r shap-largest-change-table}
+render_report_shap_largest_changes(n = 20)
+```

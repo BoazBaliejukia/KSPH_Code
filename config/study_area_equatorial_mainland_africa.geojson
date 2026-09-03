@@ -1,0 +1,36 @@
+{
+  "type": "FeatureCollection",
+  "name": "equatorial_mainland_africa_10deg",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "study_area": "mainland_africa_within_10_degrees_equator",
+        "notes": "Simplified mainland Africa polygon clipped approximately to 10 degrees north/south for the event ENM pipeline."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-15.5, 10.0],
+            [51.0, 10.0],
+            [50.0, 8.0],
+            [47.5, 4.0],
+            [43.5, 0.0],
+            [41.0, -5.0],
+            [40.0, -10.0],
+            [13.0, -10.0],
+            [10.0, -6.0],
+            [8.5, -3.0],
+            [8.5, 0.0],
+            [5.0, 1.5],
+            [1.0, 5.0],
+            [-5.0, 6.5],
+            [-10.0, 8.0],
+            [-15.5, 10.0]
+          ]
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,669 @@
+---
+title: "Interactive Event Prediction Report"
+author: "Event ENM workflow"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    self_contained: false
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+required_packages <- c("shiny", "leaflet", "terra", "htmltools")
+missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing_packages) > 0) {
+  stop("Install required packages before running this report: ", paste(missing_packages, collapse = ", "), call. = FALSE)
+}
+
+library(shiny)
+library(leaflet)
+library(htmltools)
+
+get_current_script_path <- function() {
+  command_args <- commandArgs(trailingOnly = FALSE)
+  file_arg <- grep("^--file=", command_args, value = TRUE)
+  if (length(file_arg) > 0) {
+    return(normalizePath(sub("^--file=", "", file_arg[1]), winslash = "/", mustWork = TRUE))
+  }
+
+  for (frame in rev(sys.frames())) {
+    if (!is.null(frame$ofile)) {
+      return(normalizePath(frame$ofile, winslash = "/", mustWork = TRUE))
+    }
+  }
+
+  if (requireNamespace("rstudioapi", quietly = TRUE) && rstudioapi::isAvailable()) {
+    active_doc <- tryCatch(rstudioapi::getActiveDocumentContext()$path, error = function(e) NA_character_)
+    if (!is.na(active_doc) && nzchar(active_doc)) {
+      return(normalizePath(active_doc, winslash = "/", mustWork = TRUE))
+    }
+  }
+
+  NA_character_
+}
+
+find_code_dir <- function() {
+  script_path <- get_current_script_path()
+  wd <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+  script_dir <- if (!is.na(script_path)) dirname(script_path) else NA_character_
+  wd_parents <- normalizePath(
+    file.path(wd, c(".", "..", "../..", "../../..")),
+    winslash = "/",
+    mustWork = FALSE
+  )
+  script_candidates <- if (!is.na(script_dir)) {
+    normalizePath(
+      file.path(script_dir, c(".", "..", "../..")),
+      winslash = "/",
+      mustWork = FALSE
+    )
+  } else {
+    character(0)
+  }
+
+  candidates <- c(
+    script_candidates,
+    wd_parents,
+    file.path(wd_parents, "KSPH Code")
+  )
+
+  candidates <- unique(normalizePath(candidates, winslash = "/", mustWork = FALSE))
+  for (candidate in candidates) {
+    if (
+      file.exists(file.path(candidate, "config", "predictor_list.csv")) &&
+      dir.exists(file.path(candidate, "R_python_code"))
+    ) {
+      return(candidate)
+    }
+  }
+
+  stop(
+    "Could not locate the KSPH Code repo root. Open this report from inside the KSPH Code project, ",
+    "or set CODE_DIR manually near the top of 04_interactive_prediction_report_Shiny.Rmd.",
+    call. = FALSE
+  )
+}
+
+CODE_DIR <- find_code_dir()
+PREDICTION_DIR <- file.path(CODE_DIR, "outputs", "predictions")
+TEMPORAL_FORWARD_DIR <- file.path(CODE_DIR, "outputs", "tfv", "all_types")
+TEMPORAL_FORWARD_COMPARISON_PREDICTION_DIR <- file.path(
+  TEMPORAL_FORWARD_DIR,
+  "maps_2022_2025",
+  "pred"
+)
+
+PREDICTION_YEARS <- 2020:2025
+CHANGE_YEARS <- 2021:2025
+TEMPORAL_FORWARD_PREDICTION_YEARS <- 2022:2025
+TEMPORAL_FORWARD_CHANGE_YEARS <- 2023:2025
+RASTER_CRS <- "EPSG:4326"
+TOP_PERCENTILE <- 0.99
+MAP_OPACITY_VALUE <- 0.72
+MAP_OPACITY_TOP1 <- 0.92
+LEAFLET_MAP_HEIGHT <- "300px"
+LEAFLET_NA_COLOR <- "#00000000"
+
+ROR_BREAKPOINTS <- c(0.4, 0.7, 1.5, 5, 15)
+CHANGE_RATIO_BREAKPOINTS <- c(0.6, 0.8, 1.2, 1.6, 2)
+ROR_VALUE_COLORS <- c("green4", "lightgreen", "white", "red", "darkred", "purple4")
+CHANGE_RATIO_VALUE_COLORS <- c("blue3", "lightblue", "white", "orange1", "red2", "red4")
+TOP_PERCENTILE_COLOR <- "red"
+
+raster_cache <- new.env(parent = emptyenv())
+
+temporal_forward_run_name <- function(year) {
+  sprintf("tr2001_%s_p%s", as.integer(year) - 1L, as.integer(year))
+}
+
+temporal_forward_ror_path <- function(year) {
+  comparison_path <- file.path(
+    TEMPORAL_FORWARD_COMPARISON_PREDICTION_DIR,
+    "ror",
+    sprintf("event_probability_ROR_%s.tif", year)
+  )
+  run_path <- file.path(
+    TEMPORAL_FORWARD_DIR,
+    temporal_forward_run_name(year),
+    "pred",
+    "ror",
+    sprintf("event_probability_ROR_%s.tif", year)
+  )
+
+  if (file.exists(comparison_path) || !file.exists(run_path)) {
+    return(comparison_path)
+  }
+  run_path
+}
+
+prediction_sources <- list(
+  all_years = list(
+    label = "Fully trained model",
+    prediction_years = PREDICTION_YEARS,
+    change_years = CHANGE_YEARS,
+    ror_path = function(year) {
+      file.path(PREDICTION_DIR, "ROR estimates", sprintf("event_probability_ROR_%s.tif", year))
+    },
+    ror_change_path = function(year) {
+      file.path(PREDICTION_DIR, "ROR 1yr ratios", sprintf("chgROR_1yr_%s_over_%s.tif", year, year - 1))
+    }
+  ),
+  step_forward = list(
+    label = "Step-forward model",
+    prediction_years = TEMPORAL_FORWARD_PREDICTION_YEARS,
+    change_years = TEMPORAL_FORWARD_CHANGE_YEARS,
+    ror_path = temporal_forward_ror_path,
+    ror_change_path = function(year) {
+      file.path(
+        TEMPORAL_FORWARD_COMPARISON_PREDICTION_DIR,
+        "ror_1yr",
+        sprintf("chgROR_1yr_%s_over_%s.tif", year, year - 1)
+      )
+    }
+  )
+)
+
+event_report_products <- list(
+  ror = list(
+    label = "Relative odds ratio",
+    value_choice_label = "Overall ROR predictions",
+    top_choice_label = "Top 1% of ROR predictions",
+    source_years = function(source) source$prediction_years,
+    year_label = function(year) as.character(year),
+    raster_path = function(source, year) source$ror_path(year),
+    value_layer = "ROR_mean",
+    top_layer = "ROR_mean_top1pct",
+    breakpoints = ROR_BREAKPOINTS,
+    colors = ROR_VALUE_COLORS,
+    legend_title = "Mean ROR",
+    top_legend_title = "Top 1% ROR"
+  ),
+  ror_change = list(
+    label = "1-year ROR ratio",
+    value_choice_label = "1-year ratio measure",
+    top_choice_label = "Top 1% of 1-year ratios",
+    source_years = function(source) source$change_years,
+    year_label = function(year) sprintf("%s / %s", year, year - 1),
+    raster_path = function(source, year) source$ror_change_path(year),
+    value_layer = "chgROR_1yr_mean",
+    top_layer = "chgROR_1yr_mean_top1pct",
+    breakpoints = CHANGE_RATIO_BREAKPOINTS,
+    colors = CHANGE_RATIO_VALUE_COLORS,
+    legend_title = "Mean ratio",
+    top_legend_title = "Top 1% ratios"
+  )
+)
+
+available_year_choices <- function(product, source_id) {
+  source <- prediction_sources[[source_id]]
+  if (is.null(source)) {
+    return(character(0))
+  }
+
+  product_years <- product$source_years(source)
+  existing <- product_years[vapply(
+    product_years,
+    function(year) file.exists(product$raster_path(source, year)),
+    logical(1)
+  )]
+  if (length(existing) == 0) {
+    return(character(0))
+  }
+
+  stats::setNames(as.character(existing), vapply(existing, product$year_label, character(1)))
+}
+
+available_source_choices <- function(product_id) {
+  product <- event_report_products[[product_id]]
+  if (is.null(product)) {
+    return(character(0))
+  }
+
+  source_ids <- names(prediction_sources)
+  source_ids <- source_ids[vapply(
+    source_ids,
+    function(source_id) length(available_year_choices(product, source_id)) > 0,
+    logical(1)
+  )]
+
+  stats::setNames(source_ids, vapply(source_ids, function(source_id) prediction_sources[[source_id]]$label, character(1)))
+}
+
+default_source_choice <- function(product_id) {
+  choices <- available_source_choices(product_id)
+  if (length(choices) == 0) {
+    return(NA_character_)
+  }
+  if ("all_years" %in% unname(choices)) {
+    return("all_years")
+  }
+  unname(choices)[1]
+}
+
+available_product_sources <- lapply(names(event_report_products), available_source_choices)
+names(available_product_sources) <- names(event_report_products)
+missing_products <- names(available_product_sources)[vapply(available_product_sources, length, integer(1)) == 0]
+if (length(missing_products) > 0) {
+  stop(
+    "No raster files were found for report product(s): ",
+    paste(missing_products, collapse = ", "),
+    ". Run the derived raster sections in 03_train_predict_brt_simple.R and/or Section 5 of 03b_temporal_forward_validation_brt.R first.",
+    call. = FALSE
+  )
+}
+
+pretty_legend_value <- function(value) {
+  formatted <- format(signif(value, 3), scientific = FALSE, trim = TRUE)
+  sub("\\.?0+$", "", formatted)
+}
+
+discrete_break_labels <- function(breaks) {
+  if (length(breaks) < 2) {
+    return(character(0))
+  }
+
+  labels <- character(length(breaks) - 1)
+  for (i in seq_along(labels)) {
+    lower <- pretty_legend_value(breaks[i])
+    upper <- pretty_legend_value(breaks[i + 1])
+    if (i == 1) {
+      labels[i] <- paste0("<", upper)
+    } else if (i == length(labels)) {
+      labels[i] <- paste0(lower, "+")
+    } else {
+      labels[i] <- paste0(lower, "-", upper)
+    }
+  }
+  labels
+}
+
+value_bins <- function(raster_layer, breakpoints) {
+  values <- raster_numeric_values(raster_layer)
+  values <- values[is.finite(values)]
+  if (length(values) == 0) {
+    return(c(0, 1))
+  }
+
+  min_value <- min(values, na.rm = TRUE)
+  max_value <- max(values, na.rm = TRUE)
+  if (min_value == max_value) {
+    pad <- max(abs(min_value) * 0.05, 1e-6)
+    return(c(min_value - pad, max_value + pad))
+  }
+
+  breaks <- sort(unique(c(
+    min_value,
+    breakpoints[breakpoints > min_value & breakpoints < max_value],
+    max_value
+  )))
+  if (length(breaks) < 2) {
+    pad <- max(abs(min_value) * 0.05, 1e-6)
+    breaks <- c(min_value - pad, max_value + pad)
+  }
+
+  breaks
+}
+
+raster_numeric_values <- function(raster_layer) {
+  raw_values <- terra::values(raster_layer)
+  if (is.data.frame(raw_values)) {
+    raw_values <- raw_values[[1]]
+  } else if (is.matrix(raw_values)) {
+    raw_values <- raw_values[, 1]
+  } else if (is.list(raw_values)) {
+    raw_values <- raw_values[[1]]
+  }
+
+  suppressWarnings(as.numeric(raw_values))
+}
+
+layer_values <- function(raster_layer) {
+  values <- raster_numeric_values(raster_layer)
+  values[is.finite(values)]
+}
+
+cache_key <- function(source_id, product_id, year) {
+  paste(source_id, product_id, year, sep = "_")
+}
+
+read_product_raster <- function(source_id, product_id, year) {
+  key <- cache_key(source_id, product_id, year)
+  if (exists(key, envir = raster_cache, inherits = FALSE)) {
+    return(get(key, envir = raster_cache, inherits = FALSE))
+  }
+
+  source <- prediction_sources[[source_id]]
+  if (is.null(source)) {
+    stop("Unknown prediction source: ", source_id, call. = FALSE)
+  }
+  product <- event_report_products[[product_id]]
+  raster_path <- product$raster_path(source, year)
+  if (!file.exists(raster_path)) {
+    stop("Raster file does not exist: ", raster_path, call. = FALSE)
+  }
+
+  raster_stack <- terra::rast(raster_path)
+  raster_crs <- terra::crs(raster_stack)
+  if (is.na(raster_crs) || !nzchar(raster_crs)) {
+    terra::crs(raster_stack) <- RASTER_CRS
+  }
+
+  assign(key, raster_stack, envir = raster_cache)
+  raster_stack
+}
+
+make_top_percentile_layer <- function(value_layer, top_layer_name) {
+  values <- layer_values(value_layer)
+  if (length(values) == 0) {
+    top_layer <- value_layer * NA_real_
+  } else {
+    threshold <- as.numeric(stats::quantile(values, probs = TOP_PERCENTILE, na.rm = TRUE, names = FALSE))
+    top_layer <- terra::ifel(value_layer >= threshold, 1, NA_real_)
+  }
+
+  names(top_layer) <- top_layer_name
+  top_layer
+}
+
+read_report_layer <- function(source_id, product_id, year, display_mode) {
+  source <- prediction_sources[[source_id]]
+  if (is.null(source)) {
+    stop("Unknown prediction source: ", source_id, call. = FALSE)
+  }
+  product <- event_report_products[[product_id]]
+  raster_stack <- read_product_raster(source_id, product_id, year)
+
+  if (display_mode == "value") {
+    if (!product$value_layer %in% names(raster_stack)) {
+      stop("Layer '", product$value_layer, "' was not found in ", product$raster_path(source, year), call. = FALSE)
+    }
+    return(raster_stack[[product$value_layer]])
+  }
+
+  if (product$top_layer %in% names(raster_stack)) {
+    top_layer <- raster_stack[[product$top_layer]]
+    top_layer <- terra::ifel(top_layer >= 1, 1, NA_real_)
+    names(top_layer) <- product$top_layer
+    return(top_layer)
+  }
+
+  if (!product$value_layer %in% names(raster_stack)) {
+    stop("Layer '", product$value_layer, "' was not found in ", product$raster_path(source, year), call. = FALSE)
+  }
+  make_top_percentile_layer(raster_stack[[product$value_layer]], product$top_layer)
+}
+
+raster_layer_to_cells <- function(raster_layer) {
+  raster_layer <- terra::rast(raster_layer)
+  values <- raster_numeric_values(raster_layer)
+  finite_cells <- which(is.finite(values))
+  if (length(finite_cells) == 0) {
+    return(data.frame())
+  }
+
+  xy <- terra::xyFromCell(raster_layer, finite_cells)
+
+  cell_resolution <- terra::res(raster_layer)
+  data.frame(
+    lng1 = xy[, "x"] - cell_resolution[1] / 2,
+    lat1 = xy[, "y"] - cell_resolution[2] / 2,
+    lng2 = xy[, "x"] + cell_resolution[1] / 2,
+    lat2 = xy[, "y"] + cell_resolution[2] / 2,
+    value = values[finite_cells]
+  )
+}
+
+raster_value_summary <- function(raster_layer) {
+  values <- raster_numeric_values(raster_layer)
+  finite_values <- values[is.finite(values)]
+  if (length(finite_values) == 0) {
+    return("finite cells: 0")
+  }
+
+  paste0(
+    "finite cells: ", format(length(finite_values), big.mark = ","),
+    "; range: ", pretty_legend_value(min(finite_values, na.rm = TRUE)),
+    " to ", pretty_legend_value(max(finite_values, na.rm = TRUE))
+  )
+}
+
+fit_raster_bounds <- function(map, raster_layer) {
+  extent <- terra::ext(raster_layer)
+  leaflet::fitBounds(
+    map,
+    lng1 = terra::xmin(extent),
+    lat1 = terra::ymin(extent),
+    lng2 = terra::xmax(extent),
+    lat2 = terra::ymax(extent)
+  )
+}
+
+make_report_map <- function(source_id, product_id, year, display_mode) {
+  source <- prediction_sources[[source_id]]
+  if (is.null(source)) {
+    stop("Unknown prediction source: ", source_id, call. = FALSE)
+  }
+  product <- event_report_products[[product_id]]
+  raster_layer <- read_report_layer(source_id, product_id, year, display_mode)
+  finite_values <- layer_values(raster_layer)
+
+  map <- leaflet::leaflet(options = leaflet::leafletOptions(preferCanvas = TRUE)) |>
+    leaflet::addProviderTiles(leaflet::providers$Esri.WorldTopoMap, group = "Topo") |>
+    leaflet::addProviderTiles(leaflet::providers$CartoDB.Positron, group = "Light") |>
+    leaflet::addScaleBar(position = "bottomleft")
+
+  if (length(finite_values) == 0) {
+    return(
+      map |>
+        leaflet::addControl(
+          html = htmltools::HTML(paste0(
+            "<strong>No finite raster values were found.</strong><br>",
+            "Product: ", htmltools::htmlEscape(product$label), "<br>",
+            "Source: ", htmltools::htmlEscape(source$label), "<br>",
+            "Year: ", htmltools::htmlEscape(product$year_label(year)), "<br>",
+            "Layer: ", htmltools::htmlEscape(names(raster_layer)[1]), "<br>",
+            htmltools::htmlEscape(raster_value_summary(raster_layer))
+          )),
+          position = "topright"
+        ) |>
+        fit_raster_bounds(raster_layer)
+    )
+  }
+
+  if (display_mode == "value") {
+    bins <- value_bins(raster_layer, product$breakpoints)
+    legend_labels <- discrete_break_labels(bins)
+    colors <- grDevices::colorRampPalette(product$colors)(length(legend_labels))
+    palette <- leaflet::colorBin(
+      palette = colors,
+      bins = bins,
+      domain = finite_values,
+      na.color = LEAFLET_NA_COLOR
+    )
+
+    map <- map |>
+      leaflet::addRasterImage(
+        raster_layer,
+        colors = palette,
+        opacity = MAP_OPACITY_VALUE,
+        project = TRUE,
+        maxBytes = 50 * 1024 * 1024,
+        group = product$value_choice_label
+      ) |>
+      leaflet::addLegend(
+        position = "bottomright",
+        colors = rev(colors),
+        labels = rev(legend_labels),
+        title = product$legend_title,
+        opacity = MAP_OPACITY_VALUE
+      )
+  } else {
+    palette <- leaflet::colorFactor(
+      palette = TOP_PERCENTILE_COLOR,
+      domain = 1,
+      na.color = LEAFLET_NA_COLOR
+    )
+
+    map <- map |>
+      leaflet::addRasterImage(
+        raster_layer,
+        colors = palette,
+        opacity = MAP_OPACITY_TOP1,
+        project = TRUE,
+        maxBytes = 50 * 1024 * 1024,
+        group = product$top_choice_label
+      ) |>
+      leaflet::addLegend(
+        position = "bottomright",
+        colors = TOP_PERCENTILE_COLOR,
+        labels = "Top 1%",
+        title = product$top_legend_title,
+        opacity = MAP_OPACITY_TOP1
+      )
+  }
+
+  map |>
+    leaflet::addLayersControl(
+      baseGroups = c("Topo", "Light"),
+      options = leaflet::layersControlOptions(collapsed = TRUE)
+    ) |>
+    fit_raster_bounds(raster_layer)
+}
+
+year_select_control <- function(product_id, source_id, year_input_id) {
+  product <- event_report_products[[product_id]]
+  choices <- available_year_choices(product, source_id)
+
+  if (length(choices) == 0) {
+    return(htmltools::div(class = "missing-source-note", "No rasters found for this source."))
+  }
+
+  shiny::selectInput(
+    inputId = year_input_id,
+    label = "Year",
+    choices = choices,
+    selected = choices[[length(choices)]]
+  )
+}
+
+section_controls <- function(product_id, source_input_id, year_output_id, display_input_id) {
+  product <- event_report_products[[product_id]]
+  source_choices <- available_source_choices(product_id)
+  if (length(source_choices) == 0) {
+    return(htmltools::div(class = "missing-source-note", "No rasters found for this map section."))
+  }
+
+  htmltools::tagList(
+    htmltools::div(
+      class = "map-controls",
+      shiny::fluidRow(
+        shiny::column(
+          width = 4,
+          shiny::selectInput(
+            inputId = source_input_id,
+            label = "Prediction source",
+            choices = source_choices,
+            selected = default_source_choice(product_id)
+          )
+        ),
+        shiny::column(
+          width = 3,
+          shiny::uiOutput(year_output_id)
+        ),
+        shiny::column(
+          width = 5,
+          shiny::selectInput(
+            inputId = display_input_id,
+            label = "Layer",
+            choices = stats::setNames(
+              c("value", "top"),
+              c(product$value_choice_label, product$top_choice_label)
+            ),
+            selected = "value"
+          )
+        )
+      )
+    )
+  )
+}
+```
+
+```{css, echo=FALSE}
+.main-container {
+  max-width: 1600px !important;
+  width: 96% !important;
+}
+
+.section-note {
+  max-width: 1100px;
+  font-size: 1.05rem;
+  line-height: 1.45;
+  margin-bottom: 1rem;
+}
+
+.map-controls {
+  margin: 0.75rem 0 1rem 0;
+}
+
+.missing-source-note {
+  color: #8a4b00;
+  font-weight: 600;
+  margin: 0.75rem 0;
+}
+
+.leaflet {
+  border: 1px solid #cccccc;
+}
+```
+
+This report reads the GeoTIFF rasters generated by the fully trained `03_train_predict_brt_simple.R` workflow and, when available, the step-forward `03b_temporal_forward_validation_brt.R` workflow. Use the prediction-source selector to switch between the full model and the temporally forward-stepped model outputs. Run it with `rmarkdown::run("R_python_code/04_interactive_prediction_report_Shiny.Rmd")` from the KSPH Code repo root so the selectors remain active.
+
+## Overall Relative Odds Ratio Predictions
+
+<div class="section-note">
+These maps show the mean relative odds ratio (ROR) for each prediction-grid cell. A value above 1 means the estimated odds for that cell-year are higher than the study-area average odds for the same year. The top 1% option highlights cells with the highest mean ROR values for the selected year.
+</div>
+
+```{r ror-ui}
+section_controls("ror", "ror_source", "ror_year_ui", "ror_display")
+leaflet::leafletOutput("ror_map", width = "100%", height = LEAFLET_MAP_HEIGHT)
+```
+
+```{r ror-server}
+output$ror_year_ui <- shiny::renderUI({
+  req(input$ror_source)
+  year_select_control("ror", input$ror_source, "ror_year")
+})
+
+output$ror_map <- leaflet::renderLeaflet({
+  req(input$ror_source, input$ror_year, input$ror_display)
+  make_report_map(input$ror_source, "ror", as.integer(input$ror_year), input$ror_display)
+})
+```
+
+## 1-Year Change In Relative Odds Ratios
+
+<div class="section-note">
+These maps show the ratio of the current year's mean ROR to the previous year's mean ROR for the same cell. Values above 1 indicate an increase relative to the prior year; values below 1 indicate a decrease. The top 1% option highlights cells with the largest one-year increases for the selected year pair.
+</div>
+
+```{r ror-change-ui}
+section_controls("ror_change", "ror_change_source", "ror_change_year_ui", "ror_change_display")
+leaflet::leafletOutput("ror_change_map", width = "100%", height = LEAFLET_MAP_HEIGHT)
+```
+
+```{r ror-change-server}
+output$ror_change_year_ui <- shiny::renderUI({
+  req(input$ror_change_source)
+  year_select_control("ror_change", input$ror_change_source, "ror_change_year")
+})
+
+output$ror_change_map <- leaflet::renderLeaflet({
+  req(input$ror_change_source, input$ror_change_year, input$ror_change_display)
+  make_report_map(input$ror_change_source, "ror_change", as.integer(input$ror_change_year), input$ror_change_display)
+})
+```

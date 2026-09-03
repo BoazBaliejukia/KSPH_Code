@@ -1,0 +1,43 @@
+# Ignore everything by default so generated datasets, models, rasters, and
+# local exports are not committed accidentally.
+/*
+
+# Keep the repo-level documentation and ignore rules.
+!/.gitignore
+!/README.md
+
+# Keep reproducible source code and configuration inputs.
+!/R_python_code/
+!/R_python_code/**
+!/config/
+!/config/**
+
+# Ignore local R session artifacts.
+/R_python_code/.Rhistory
+/R_python_code/.RData
+/R_python_code/.Ruserdata
+/R_python_code/.Rproj.user/
+*.Rproj.user
+
+# Ignore Python/Jupyter caches.
+/R_python_code/__pycache__/
+/R_python_code/**/__pycache__/
+/R_python_code/*.pyc
+/R_python_code/**/*.pyc
+/R_python_code/.ipynb_checkpoints/
+/R_python_code/**/.ipynb_checkpoints/
+
+# Ignore knitted/generated report artifacts; keep the .Rmd source instead.
+/R_python_code/*.html
+/R_python_code/*_files/
+
+# Ignore local secrets and machine-specific environment files.
+.Renviron
+.Rprofile
+.env
+*.env
+
+# Ignore OS/editor noise.
+.DS_Store
+Thumbs.db
+desktop.ini
