@@ -63,11 +63,11 @@ if (dir.exists(WINDOWS_USER_R_LIB) && !WINDOWS_USER_R_LIB %in% .libPaths()) {
   .libPaths(c(WINDOWS_USER_R_LIB, .libPaths()))
 }
 
-PRESENCE_CSV <- file.path(CODE_DIR, "data", "outcomes_csv.csv")
+PRESENCE_CSV <- file.path(CODE_DIR, "config", "outcomes_csv.csv")
 STUDY_AREA_FILE <- file.path(CODE_DIR, "config", "africacountries_nolakes.shp")
 OUTPUT_CSV <- file.path(CODE_DIR, "data", "dataset1.csv")
 
-N_PSEUDO_ABSENCE <- 10000
+N_PSEUDO_ABSENCE <- 5000
 ABSENCE_YEARS <- 2001:2025
 RANDOM_SEED <- 20260813
 SAMPLING_VERSION <- "pseudo_absence_random_v1"
@@ -76,7 +76,8 @@ STUDY_AREA_NAME <- "equatorial_africa"
 # STUDY_AREA_FILE is the polygon used for pseudo-absence sampling. If
 # STUDY_AREA_BBOX is set, the polygon is clipped to this lon/lat box first.
 # Set STUDY_AREA_BBOX <- NULL to use the full extent of the provided polygon,
-# e.g. when a future analyst provides a country-specific shapefile.
+# e.g. when a future analyst provides a country-specific shapefile in place of 
+# the africa_nolakes shapefile i am using.
 STUDY_AREA_BBOX <- c(xmin = -15.5, ymin = -10.0, xmax = 51.0, ymax = 10.0)
 FILTER_PRESENCES_TO_STUDY_AREA <- TRUE
 ALLOW_BBOX_FALLBACK <- FALSE
@@ -103,12 +104,12 @@ normalize_study_area_bbox <- function() {
     return(NULL)
   }
 
-  bbox <- as.numeric(STUDY_AREA_BBOX)
   required_names <- c("xmin", "ymin", "xmax", "ymax")
   if (is.null(names(STUDY_AREA_BBOX)) || !all(required_names %in% names(STUDY_AREA_BBOX))) {
     stop("STUDY_AREA_BBOX must be named xmin, ymin, xmax, ymax, or set to NULL.", call. = FALSE)
   }
-  bbox <- bbox[required_names]
+  bbox <- as.numeric(STUDY_AREA_BBOX[required_names])
+  names(bbox) <- required_names
   if (any(!is.finite(bbox))) {
     stop("STUDY_AREA_BBOX values must be finite numbers.", call. = FALSE)
   }
@@ -389,3 +390,4 @@ message("Study area bbox: ", format_study_area_bbox(normalize_study_area_bbox())
 message("Rows: ", nrow(dataset1))
 message("Presences: ", sum(dataset1$outcome == 1))
 message("Pseudo-absences: ", sum(dataset1$outcome == 0))
+
