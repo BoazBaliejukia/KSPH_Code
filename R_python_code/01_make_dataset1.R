@@ -30,7 +30,7 @@ find_code_dir <- function() {
   script_path <- get_current_script_path()
   candidates <- c(
     if (!is.na(script_path)) normalizePath(file.path(dirname(script_path), ".."), winslash = "/", mustWork = FALSE),
-    file.path(getwd(), "KSPH Code"),
+    file.path(getwd(), "KSPH_Code"),
     getwd()
   )
 
@@ -380,6 +380,7 @@ dataset1 <- dataset1[, c(
   "id", "year", "latitude", "longitude", "outcome",
   "type", "country", "point_type", "source", "sampling_version", "created_date"
 )]
+dataset1 %>% view()
 
 utils::write.csv(dataset1, OUTPUT_CSV, row.names = FALSE)
 
@@ -390,4 +391,5 @@ message("Study area bbox: ", format_study_area_bbox(normalize_study_area_bbox())
 message("Rows: ", nrow(dataset1))
 message("Presences: ", sum(dataset1$outcome == 1))
 message("Pseudo-absences: ", sum(dataset1$outcome == 0))
+
 
