@@ -28,27 +28,33 @@ get_current_script_path <- function() {
   NA_character_
 }
 
+is_ksph_code_dir <- function(path) {
+  file.exists(file.path(path, "config", "predictor_list.csv")) &&
+    dir.exists(file.path(path, "R_python_code"))
+}
+
 find_code_dir <- function() {
   script_path <- get_current_script_path()
+  cwd <- getwd()
   candidates <- c(
-    if (!is.na(script_path)) normalizePath(file.path(dirname(script_path), ".."), winslash = "/", mustWork = FALSE),
-    file.path(getwd(), "KSPH Code"),
-    getwd()
+    if (!is.na(script_path)) file.path(dirname(script_path), ".."),
+    file.path(cwd, "KSPH_Code"),
+    file.path(cwd, "KSPH Code"),
+    cwd,
+    file.path(cwd, "..")
   )
 
   candidates <- unique(normalizePath(candidates, winslash = "/", mustWork = FALSE))
   for (candidate in candidates) {
-    if (
-      file.exists(file.path(candidate, "config", "predictor_list.csv")) &&
-      dir.exists(file.path(candidate, "R_python_code"))
-    ) {
+    if (is_ksph_code_dir(candidate)) {
       return(candidate)
     }
   }
 
   stop(
-    "Could not locate the KSPH Code directory. Run this with source('R_python_code/03_train_predict_brt_simple.R') ",
-    "from the KSPH Code repo root, or source('KSPH Code/R_python_code/03_train_predict_brt_simple.R') from the parent folder.",
+    "Could not locate the KSPH_Code directory from working directory: ", cwd, ". ",
+    "From the parent repo run source('KSPH_Code/R_python_code/03_train_predict_brt_simple.R'), ",
+    "or setwd() into KSPH_Code and source('R_python_code/03_train_predict_brt_simple.R').",
     call. = FALSE
   )
 }
@@ -3374,7 +3380,7 @@ message("Output directory: ", OUTPUT_DIR)
 dataset2 <- utils::read.csv(TRAINING_CSV, stringsAsFactors = FALSE)
 prediction_grid <- utils::read.csv(PREDICTION_GRID_CSV, stringsAsFactors = FALSE)
 dataset2 <- filter_training_dataset_by_type(dataset2)
-
+dataset2 %>% glimpse()
 predictor_names <- identify_predictors(dataset2, prediction_grid)
 dataset2 <- as_numeric_predictors(dataset2, predictor_names)
 prediction_grid <- as_numeric_predictors(prediction_grid, predictor_names)
@@ -3382,7 +3388,7 @@ dataset2 <- fill_hansen_land_na_with_zero(dataset2)
 prediction_grid <- fill_hansen_land_na_with_zero(prediction_grid)
 prediction_grid <- add_country_to_prediction_grid(prediction_grid)
 dataset2[[OUTCOME_COLUMN]] <- as.integer(dataset2[[OUTCOME_COLUMN]])
-
+dataset2 %>% view()
 check_training_dataset(dataset2, predictor_names)
 utils::write.csv(data.frame(predictor = predictor_names), PREDICTOR_NAMES_CSV, row.names = FALSE)
 saveRDS(predictor_names, PREDICTOR_NAMES_RDS)

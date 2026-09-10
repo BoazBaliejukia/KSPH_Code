@@ -1,10 +1,13 @@
-#### 04 Train SuperLearner With CV And Predict Event Probability ####
+#### 05 Train Aim-1 SuperLearner (GBM + RF + SVM) And Predict Event Probability ####
 
-# This script mirrors the table-first prediction workflow in
-# 03_train_predict_brt_simple.R, but fits a SuperLearner model instead of a BRT.
-# It keeps the first pass deliberately light: three quick learners, 10-fold
-# outer cross-validation, F1-based candidate/threshold selection, and annual
-# prediction maps for 2020-2025.
+# Mirrors the table-first prediction workflow in 03_train_predict_brt_simple.R,
+# but fits a protocol Aim-1 ensemble: gradient boosting (GBM), random forest,
+# and SVM, combined with SuperLearner weighted averaging.
+#
+# Outer stratified 10-fold CV scores the ensemble and each base learner.
+# The stacked ensemble is retained only if it improves ROC-AUC over the best
+# single learner (PR-AUC reported alongside). Otherwise the discrete winner
+# is used for the final fit and prediction maps.
 
 
 #### Configuration ####
@@ -83,6 +86,7 @@ FOLD_ASSIGNMENT_CSV <- file.path(MODEL_DIR, "cv_fold_assignments.csv")
 SL_TUNING_RESULTS_RDS <- file.path(MODEL_DIR, "superlearner_tuning_results.rds")
 SL_TUNING_RESULTS_CSV <- file.path(MODEL_DIR, "superlearner_tuning_results.csv")
 SL_CV_PREDICTIONS_CSV <- file.path(MODEL_DIR, "superlearner_cv_predictions.csv")
+SL_LEARNER_COMPARISON_CSV <- file.path(MODEL_DIR, "superlearner_learner_comparison.csv")
 SL_BEST_SETTINGS_RDS <- file.path(MODEL_DIR, "superlearner_best_settings.rds")
 SL_BEST_SETTINGS_CSV <- file.path(MODEL_DIR, "superlearner_best_settings.csv")
 SL_FIT_RDS <- file.path(MODEL_DIR, "superlearner_fit.rds")
@@ -105,22 +109,22 @@ PREDICTION_BASE_COLUMNS <- c("grid_id", "grid_batch", "x", "y", "year", "longitu
 
 N_FOLDS <- 10
 SL_INTERNAL_FOLDS <- 5
-SL_LIBRARY <- c("SL.glm", "SL.rpart_tuned", "SL.ranger_tuned")
+# Protocol Aim 1 base learners (order: GBM primary, then RF, then SVM).
+SL_LIBRARY <- c("SL.aim1_gbm", "SL.aim1_rf", "SL.aim1_svm")
 SL_METHOD <- "method.NNloglik"
-RANGER_THREADS <- 1
 USE_CLASS_WEIGHTS <- FALSE
+# Retain SuperLearner stack only if CV ROC-AUC strictly beats the best base learner.
+RETAIN_ENSEMBLE_IF_BETTER <- TRUE
 
-# Keep this grid small while the workflow is being tested. Each row is one
-# SuperLearner candidate evaluated by the same 10 outer folds and F1 threshold
-# grid.
+# Default: one Aim-1 candidate. Add rows to explore GBM/RF settings later.
 SL_TUNING_GRID <- data.frame(
-  candidate_id = c("quick_conservative", "quick_balanced", "quick_flexible"),
-  rpart_cp = c(0.010, 0.005, 0.002),
-  rpart_maxdepth = c(4L, 5L, 6L),
-  rpart_minbucket = c(20L, 12L, 8L),
-  ranger_num_trees = c(150L, 200L, 250L),
-  ranger_mtry_fraction = c(0.35, 0.50, 0.65),
-  ranger_min_node_size = c(20L, 12L, 8L),
+  candidate_id = "aim1_default",
+  gbm_n_trees = 200L,
+  gbm_interaction_depth = 3L,
+  gbm_shrinkage = 0.05,
+  rf_ntree = 500L,
+  rf_nodesize = 5L,
+  svm_C = 1,
   stringsAsFactors = FALSE
 )
 
@@ -458,84 +462,190 @@ find_best_f1_threshold <- function(truth, probability, threshold_grid) {
 .SL_TUNING_ENV <- new.env(parent = emptyenv())
 
 set_sl_tuning_params <- function(candidate) {
-  .SL_TUNING_ENV$rpart_cp <- as.numeric(candidate$rpart_cp)
-  .SL_TUNING_ENV$rpart_maxdepth <- as.integer(candidate$rpart_maxdepth)
-  .SL_TUNING_ENV$rpart_minbucket <- as.integer(candidate$rpart_minbucket)
-  .SL_TUNING_ENV$ranger_num_trees <- as.integer(candidate$ranger_num_trees)
-  .SL_TUNING_ENV$ranger_mtry_fraction <- as.numeric(candidate$ranger_mtry_fraction)
-  .SL_TUNING_ENV$ranger_min_node_size <- as.integer(candidate$ranger_min_node_size)
+  .SL_TUNING_ENV$gbm_n_trees <- as.integer(candidate$gbm_n_trees)
+  .SL_TUNING_ENV$gbm_interaction_depth <- as.integer(candidate$gbm_interaction_depth)
+  .SL_TUNING_ENV$gbm_shrinkage <- as.numeric(candidate$gbm_shrinkage)
+  .SL_TUNING_ENV$rf_ntree <- as.integer(candidate$rf_ntree)
+  .SL_TUNING_ENV$rf_nodesize <- as.integer(candidate$rf_nodesize)
+  .SL_TUNING_ENV$svm_C <- as.numeric(candidate$svm_C)
   invisible(TRUE)
 }
 
-event_factor <- function(y) {
-  factor(ifelse(y == EVENT_VALUE, "event", "control"), levels = c("control", "event"))
+roc_auc <- function(y, p) {
+  keep <- is.finite(p) & !is.na(y)
+  y <- as.integer(y[keep])
+  p <- as.numeric(p[keep])
+  if (length(unique(y)) < 2) {
+    return(NA_real_)
+  }
+  as.numeric(pROC::auc(pROC::roc(y, p, quiet = TRUE, levels = c(0, 1), direction = "<")))
 }
 
-probability_from_two_class_matrix <- function(pred_matrix, event_level = "event") {
+pr_auc <- function(y, p) {
+  keep <- is.finite(p) & !is.na(y)
+  y <- as.integer(y[keep])
+  p <- as.numeric(p[keep])
+  if (!any(y == 1L) || length(y) == 0) {
+    return(NA_real_)
+  }
+  ord <- order(p, decreasing = TRUE)
+  y <- y[ord]
+  tp <- cumsum(y)
+  fp <- cumsum(1L - y)
+  prec <- tp / pmax(tp + fp, 1L)
+  rec <- tp / sum(y)
+  rec <- c(0, rec)
+  prec <- c(1, prec)
+  sum((rec[-1] - rec[-length(rec)]) * (prec[-1] + prec[-length(prec)]) / 2)
+}
+
+probability_from_event_matrix <- function(pred_matrix, event_level = "1") {
   if (is.null(dim(pred_matrix))) {
     return(as.numeric(pred_matrix))
   }
-  if (event_level %in% colnames(pred_matrix)) {
+  cn <- colnames(pred_matrix)
+  if (!is.null(cn) && event_level %in% cn) {
     return(as.numeric(pred_matrix[, event_level]))
   }
-  rep(NA_real_, nrow(pred_matrix))
+  if (!is.null(cn) && "event" %in% cn) {
+    return(as.numeric(pred_matrix[, "event"]))
+  }
+  as.numeric(pred_matrix[, ncol(pred_matrix)])
 }
 
-SL.rpart_tuned <- function(Y, X, newX, family, obsWeights, id, ...) {
-  data <- data.frame(Y = event_factor(Y), as.data.frame(X), check.names = FALSE)
-  fit <- rpart::rpart(
+# --- Aim 1 SuperLearner wrappers (GBM, RF, SVM) ---
+
+SL.aim1_gbm <- function(Y, X, newX, family, obsWeights, id, ...) {
+  require_package("gbm")
+  X <- as.data.frame(X, check.names = FALSE)
+  newX <- as.data.frame(newX, check.names = FALSE)
+  dat <- data.frame(Y = as.numeric(Y), X, check.names = FALSE)
+  fit <- gbm::gbm(
     Y ~ .,
-    data = data,
-    method = "class",
+    data = dat,
+    distribution = "bernoulli",
+    n.trees = .SL_TUNING_ENV$gbm_n_trees,
+    interaction.depth = .SL_TUNING_ENV$gbm_interaction_depth,
+    shrinkage = .SL_TUNING_ENV$gbm_shrinkage,
     weights = obsWeights,
-    control = rpart::rpart.control(
-      cp = .SL_TUNING_ENV$rpart_cp,
-      maxdepth = .SL_TUNING_ENV$rpart_maxdepth,
-      minbucket = .SL_TUNING_ENV$rpart_minbucket
+    verbose = FALSE,
+    keep.data = FALSE
+  )
+  pred <- as.numeric(gbm::predict.gbm(
+    fit,
+    newdata = newX,
+    n.trees = .SL_TUNING_ENV$gbm_n_trees,
+    type = "response"
+  ))
+  out <- list(
+    object = fit,
+    n_trees = .SL_TUNING_ENV$gbm_n_trees
+  )
+  class(out) <- "SL.aim1_gbm"
+  list(pred = pred, fit = out)
+}
+
+predict.SL.aim1_gbm <- function(object, newdata, ...) {
+  as.numeric(gbm::predict.gbm(
+    object$object,
+    newdata = as.data.frame(newdata, check.names = FALSE),
+    n.trees = object$n_trees,
+    type = "response"
+  ))
+}
+
+SL.aim1_rf <- function(Y, X, newX, family, obsWeights, id, ...) {
+  require_package("randomForest")
+  X <- as.data.frame(X, check.names = FALSE)
+  newX <- as.data.frame(newX, check.names = FALSE)
+  y_factor <- factor(as.integer(Y), levels = c(0, 1))
+  dat <- data.frame(Y = y_factor, X, check.names = FALSE)
+  fit <- suppressWarnings(
+    randomForest::randomForest(
+      Y ~ .,
+      data = dat,
+      ntree = .SL_TUNING_ENV$rf_ntree,
+      nodesize = .SL_TUNING_ENV$rf_nodesize
     )
   )
-  pred <- probability_from_two_class_matrix(predict(fit, newdata = as.data.frame(newX), type = "prob"))
-  fit <- list(object = fit)
-  class(fit) <- "SL.rpart_tuned"
-  list(pred = pred, fit = fit)
-}
-
-predict.SL.rpart_tuned <- function(object, newdata, ...) {
-  probability_from_two_class_matrix(predict(object$object, newdata = as.data.frame(newdata), type = "prob"))
-}
-
-SL.ranger_tuned <- function(Y, X, newX, family, obsWeights, id, ...) {
-  X <- as.data.frame(X)
-  newX <- as.data.frame(newX)
-  mtry <- max(1L, min(ncol(X), round(.SL_TUNING_ENV$ranger_mtry_fraction * ncol(X))))
-  data <- data.frame(Y = event_factor(Y), X, check.names = FALSE)
-
-  fit <- ranger::ranger(
-    dependent.variable.name = "Y",
-    data = data,
-    probability = TRUE,
-    num.trees = .SL_TUNING_ENV$ranger_num_trees,
-    mtry = mtry,
-    min.node.size = .SL_TUNING_ENV$ranger_min_node_size,
-    case.weights = obsWeights,
-    num.threads = RANGER_THREADS,
-    seed = RANDOM_SEED
+  pred <- probability_from_event_matrix(
+    predict(fit, newdata = newX, type = "prob"),
+    event_level = "1"
   )
-  pred <- probability_from_two_class_matrix(predict(fit, data = newX)$predictions)
-  fit <- list(object = fit)
-  class(fit) <- "SL.ranger_tuned"
-  list(pred = pred, fit = fit)
+  out <- list(object = fit)
+  class(out) <- "SL.aim1_rf"
+  list(pred = pred, fit = out)
 }
 
-predict.SL.ranger_tuned <- function(object, newdata, ...) {
-  probability_from_two_class_matrix(predict(object$object, data = as.data.frame(newdata))$predictions)
+predict.SL.aim1_rf <- function(object, newdata, ...) {
+  probability_from_event_matrix(
+    predict(object$object, newdata = as.data.frame(newdata, check.names = FALSE), type = "prob"),
+    event_level = "1"
+  )
+}
+
+SL.aim1_svm <- function(Y, X, newX, family, obsWeights, id, ...) {
+  require_package("kernlab")
+  X <- as.data.frame(X, check.names = FALSE)
+  newX <- as.data.frame(newX, check.names = FALSE)
+  y_factor <- factor(as.integer(Y), levels = c(0, 1))
+  dat <- data.frame(Y = y_factor, X, check.names = FALSE)
+  fit <- kernlab::ksvm(
+    Y ~ .,
+    data = dat,
+    type = "C-svc",
+    kernel = "rbfdot",
+    C = .SL_TUNING_ENV$svm_C,
+    prob.model = TRUE
+  )
+  pred_mat <- tryCatch(
+    kernlab::predict(fit, newX, type = "probabilities"),
+    error = function(e) {
+      as.numeric(as.character(kernlab::predict(fit, newX)))
+    }
+  )
+  pred <- probability_from_event_matrix(pred_mat, event_level = "1")
+  out <- list(object = fit)
+  class(out) <- "SL.aim1_svm"
+  list(pred = pred, fit = out)
+}
+
+predict.SL.aim1_svm <- function(object, newdata, ...) {
+  nd <- as.data.frame(newdata, check.names = FALSE)
+  pred_mat <- tryCatch(
+    kernlab::predict(object$object, nd, type = "probabilities"),
+    error = function(e) {
+      as.numeric(as.character(kernlab::predict(object$object, nd)))
+    }
+  )
+  probability_from_event_matrix(pred_mat, event_level = "1")
+}
+
+register_aim1_superlearners <- function() {
+  wrappers <- list(
+    SL.aim1_gbm = SL.aim1_gbm,
+    predict.SL.aim1_gbm = predict.SL.aim1_gbm,
+    SL.aim1_rf = SL.aim1_rf,
+    predict.SL.aim1_rf = predict.SL.aim1_rf,
+    SL.aim1_svm = SL.aim1_svm,
+    predict.SL.aim1_svm = predict.SL.aim1_svm
+  )
+  for (nm in names(wrappers)) {
+    assign(nm, wrappers[[nm]], envir = .GlobalEnv)
+  }
+  invisible(names(wrappers))
+}
+
+library_short_names <- function(library_names) {
+  gsub("_All$", "", library_names)
 }
 
 fit_superlearner_model <- function(X, y, candidate, obs_weights) {
   set_sl_tuning_params(candidate)
+  register_aim1_superlearners()
   SuperLearner::SuperLearner(
     Y = y,
-    X = as.data.frame(X),
+    X = as.data.frame(X, check.names = FALSE),
     family = stats::binomial(),
     SL.library = SL_LIBRARY,
     method = SL_METHOD,
@@ -545,18 +655,81 @@ fit_superlearner_model <- function(X, y, candidate, obs_weights) {
   )
 }
 
+fit_discrete_base_learner <- function(learner_name, X, y, candidate, obs_weights) {
+  set_sl_tuning_params(candidate)
+  register_aim1_superlearners()
+  learner_fun <- get(learner_name, envir = .GlobalEnv)
+  fit_obj <- learner_fun(
+    Y = y,
+    X = as.data.frame(X, check.names = FALSE),
+    newX = as.data.frame(X, check.names = FALSE),
+    family = stats::binomial(),
+    obsWeights = obs_weights,
+    id = NULL
+  )
+  list(
+    learner_name = learner_name,
+    fit = fit_obj$fit
+  )
+}
+
 predict_superlearner_probability <- function(model, X) {
-  as.numeric(predict(model, newdata = as.data.frame(X), onlySL = TRUE)$pred)
+  as.numeric(stats::predict(model, newdata = as.data.frame(X, check.names = FALSE), onlySL = TRUE)$pred)
+}
+
+predict_discrete_probability <- function(discrete_fit, X) {
+  pred_fun <- get(paste0("predict.", class(discrete_fit$fit)[1]), envir = .GlobalEnv)
+  as.numeric(pred_fun(discrete_fit$fit, newdata = as.data.frame(X, check.names = FALSE)))
+}
+
+predict_aim1_probability <- function(model_object, X) {
+  if (isTRUE(model_object$retain_ensemble)) {
+    predict_superlearner_probability(model_object$model, X)
+  } else {
+    predict_discrete_probability(model_object$discrete_fit, X)
+  }
 }
 
 candidate_from_grid <- function(row_index) {
   as.list(SL_TUNING_GRID[row_index, , drop = FALSE])
 }
 
+decide_retain_ensemble <- function(y, ensemble_pred, library_pred) {
+  comparison <- data.frame(
+    learner = c("SuperLearner", library_short_names(colnames(library_pred))),
+    roc_auc = c(
+      roc_auc(y, ensemble_pred),
+      vapply(seq_len(ncol(library_pred)), function(j) roc_auc(y, library_pred[, j]), numeric(1))
+    ),
+    pr_auc = c(
+      pr_auc(y, ensemble_pred),
+      vapply(seq_len(ncol(library_pred)), function(j) pr_auc(y, library_pred[, j]), numeric(1))
+    ),
+    stringsAsFactors = FALSE
+  )
+  base <- comparison[comparison$learner != "SuperLearner", , drop = FALSE]
+  best_base <- base[which.max(base$roc_auc), , drop = FALSE]
+  ensemble_auc <- comparison$roc_auc[comparison$learner == "SuperLearner"][1]
+  retain <- isTRUE(RETAIN_ENSEMBLE_IF_BETTER) &&
+    is.finite(ensemble_auc) &&
+    is.finite(best_base$roc_auc[1]) &&
+    ensemble_auc > best_base$roc_auc[1]
+
+  list(
+    comparison = comparison,
+    best_base_learner = best_base$learner[1],
+    best_base_roc_auc = best_base$roc_auc[1],
+    ensemble_roc_auc = ensemble_auc,
+    retain_ensemble = retain,
+    selected_learner = if (retain) "SuperLearner" else best_base$learner[1]
+  )
+}
+
 cross_validate_superlearner_candidate <- function(training_df, predictor_names, fold_id, candidate) {
   X <- training_df[, predictor_names, drop = FALSE]
   y <- training_df[[OUTCOME_COLUMN]]
-  cv_pred <- rep(NA_real_, nrow(training_df))
+  cv_ensemble <- rep(NA_real_, nrow(training_df))
+  cv_library <- NULL
 
   for (fold in sort(unique(fold_id))) {
     message("    fold ", fold, " of ", length(unique(fold_id)))
@@ -570,20 +743,49 @@ cross_validate_superlearner_candidate <- function(training_df, predictor_names, 
       candidate = candidate,
       obs_weights = obs_weights
     )
-    cv_pred[valid_rows] <- predict_superlearner_probability(
+    fold_pred <- stats::predict(
       fold_fit,
-      X[valid_rows, , drop = FALSE]
+      newdata = as.data.frame(X[valid_rows, , drop = FALSE], check.names = FALSE),
+      onlySL = FALSE
     )
-    rm(fold_fit)
+    cv_ensemble[valid_rows] <- as.numeric(fold_pred$pred)
+    lib_mat <- as.matrix(fold_pred$library.predict)
+    if (is.null(cv_library)) {
+      cv_library <- matrix(NA_real_, nrow = nrow(training_df), ncol = ncol(lib_mat))
+      colnames(cv_library) <- colnames(lib_mat)
+    }
+    cv_library[valid_rows, ] <- lib_mat
+    rm(fold_fit, fold_pred)
     gc()
   }
 
-  best_threshold <- find_best_f1_threshold(y, cv_pred, THRESHOLD_GRID)
-  list(cv_pred = cv_pred, best_threshold = best_threshold)
+  retain_decision <- decide_retain_ensemble(y, cv_ensemble, cv_library)
+  selected_pred <- if (isTRUE(retain_decision$retain_ensemble)) {
+    cv_ensemble
+  } else {
+    selected_col <- which(library_short_names(colnames(cv_library)) == retain_decision$selected_learner)
+    if (length(selected_col) != 1) {
+      selected_col <- which.max(
+        vapply(seq_len(ncol(cv_library)), function(j) roc_auc(y, cv_library[, j]), numeric(1))
+      )
+      retain_decision$selected_learner <- library_short_names(colnames(cv_library))[selected_col]
+    }
+    as.numeric(cv_library[, selected_col])
+  }
+
+  best_threshold <- find_best_f1_threshold(y, selected_pred, THRESHOLD_GRID)
+  list(
+    cv_pred = selected_pred,
+    cv_ensemble = cv_ensemble,
+    cv_library = cv_library,
+    retain_decision = retain_decision,
+    best_threshold = best_threshold
+  )
 }
 
 select_best_tuning_result <- function(tuning_results) {
   tuning_results <- tuning_results[order(
+    -tuning_results$selected_roc_auc,
     -tuning_results$f1,
     -tuning_results$precision,
     -tuning_results$recall,
@@ -607,8 +809,8 @@ prediction_metadata_columns <- function(df) {
 make_superlearner_prediction_table <- function(prediction_grid, predictor_names, model_object) {
   metadata_columns <- prediction_metadata_columns(prediction_grid)
   prediction_table <- prediction_grid[, metadata_columns, drop = FALSE]
-  prediction_table$pred_superlearner <- predict_superlearner_probability(
-    model_object$model,
+  prediction_table$pred_superlearner <- predict_aim1_probability(
+    model_object,
     prediction_grid[, predictor_names, drop = FALSE]
   )
   prediction_table
@@ -710,9 +912,13 @@ plot_annual_summary_rasters <- function(raster_stack, year) {
 #### 1. Read Training Dataset ####
 
 require_package("SuperLearner")
-require_package("rpart")
-require_package("ranger")
+require_package("gbm")
+require_package("randomForest")
+require_package("kernlab")
+require_package("pROC")
 require_package("terra")
+
+register_aim1_superlearners()
 
 make_dir(MODEL_DIR)
 make_dir(OUTPUT_DIR)
@@ -743,8 +949,9 @@ message("Events: ", sum(dataset2[[OUTCOME_COLUMN]] == EVENT_VALUE))
 message("Controls: ", sum(dataset2[[OUTCOME_COLUMN]] == CONTROL_VALUE))
 message("Prediction-grid rows available: ", format(nrow(prediction_grid_raw), big.mark = ","))
 message("Predictors: ", length(predictor_names))
-message("SuperLearner library: ", paste(SL_LIBRARY, collapse = ", "))
+message("Aim-1 SuperLearner library: ", paste(SL_LIBRARY, collapse = ", "))
 message("Outer CV folds: ", N_FOLDS)
+message("Retain ensemble if better than best base learner: ", RETAIN_ENSEMBLE_IF_BETTER)
 message("Class weights enabled: ", USE_CLASS_WEIGHTS)
 
 
@@ -764,15 +971,19 @@ print(fold_table)
 message("Saved fold assignments: ", FOLD_ASSIGNMENT_CSV)
 
 
-#### 3. Tune SuperLearner With 10-Fold CV And F1 ####
+#### 3. Tune Aim-1 SuperLearner With 10-Fold CV, Retain-If-Better, And F1 ####
 
 if (!file.exists(SL_TUNING_RESULTS_RDS) || OVERWRITE_CV_RESULTS) {
   tuning_results <- data.frame()
   cv_prediction_list <- list()
+  learner_comparison_list <- list()
 
   for (candidate_index in seq_len(nrow(SL_TUNING_GRID))) {
     candidate <- candidate_from_grid(candidate_index)
-    message("Evaluating SuperLearner candidate ", candidate_index, " of ", nrow(SL_TUNING_GRID), ": ", candidate$candidate_id)
+    message(
+      "Evaluating Aim-1 SuperLearner candidate ", candidate_index, " of ",
+      nrow(SL_TUNING_GRID), ": ", candidate$candidate_id
+    )
 
     cv_result <- cross_validate_superlearner_candidate(
       training_df = dataset2,
@@ -781,12 +992,27 @@ if (!file.exists(SL_TUNING_RESULTS_RDS) || OVERWRITE_CV_RESULTS) {
       candidate = candidate
     )
 
+    retain_decision <- cv_result$retain_decision
     best_threshold <- cv_result$best_threshold
+    selected_roc <- roc_auc(dataset2[[OUTCOME_COLUMN]], cv_result$cv_pred)
+    selected_pr <- pr_auc(dataset2[[OUTCOME_COLUMN]], cv_result$cv_pred)
+
     candidate_result <- cbind(
       SL_TUNING_GRID[candidate_index, , drop = FALSE],
-      best_threshold
+      best_threshold,
+      retain_ensemble = retain_decision$retain_ensemble,
+      selected_learner = retain_decision$selected_learner,
+      ensemble_roc_auc = retain_decision$ensemble_roc_auc,
+      best_base_learner = retain_decision$best_base_learner,
+      best_base_roc_auc = retain_decision$best_base_roc_auc,
+      selected_roc_auc = selected_roc,
+      selected_pr_auc = selected_pr
     )
     tuning_results <- rbind(tuning_results, candidate_result)
+
+    comparison <- retain_decision$comparison
+    comparison$candidate_id <- candidate$candidate_id
+    learner_comparison_list[[candidate_index]] <- comparison
 
     cv_prediction_list[[candidate_index]] <- data.frame(
       candidate_id = candidate$candidate_id,
@@ -794,16 +1020,29 @@ if (!file.exists(SL_TUNING_RESULTS_RDS) || OVERWRITE_CV_RESULTS) {
       id = dataset2$id,
       outcome = dataset2[[OUTCOME_COLUMN]],
       fold = fold_id,
-      cv_probability = cv_result$cv_pred
+      cv_probability = cv_result$cv_pred,
+      cv_ensemble_probability = cv_result$cv_ensemble,
+      retain_ensemble = retain_decision$retain_ensemble,
+      selected_learner = retain_decision$selected_learner,
+      stringsAsFactors = FALSE
+    )
+
+    message(
+      "  Ensemble ROC-AUC: ", signif(retain_decision$ensemble_roc_auc, 4),
+      " | Best base (", retain_decision$best_base_learner, "): ",
+      signif(retain_decision$best_base_roc_auc, 4),
+      " | Retain ensemble: ", retain_decision$retain_ensemble
     )
   }
 
   best_settings <- select_best_tuning_result(tuning_results)
   cv_predictions <- do.call(rbind, cv_prediction_list)
+  learner_comparison <- do.call(rbind, learner_comparison_list)
 
   saveRDS(tuning_results, SL_TUNING_RESULTS_RDS)
   utils::write.csv(tuning_results, SL_TUNING_RESULTS_CSV, row.names = FALSE)
   utils::write.csv(cv_predictions, SL_CV_PREDICTIONS_CSV, row.names = FALSE)
+  utils::write.csv(learner_comparison, SL_LEARNER_COMPARISON_CSV, row.names = FALSE)
   saveRDS(best_settings, SL_BEST_SETTINGS_RDS)
   utils::write.csv(best_settings, SL_BEST_SETTINGS_CSV, row.names = FALSE)
 } else {
@@ -812,7 +1051,15 @@ if (!file.exists(SL_TUNING_RESULTS_RDS) || OVERWRITE_CV_RESULTS) {
 }
 
 print(tuning_results)
-message("Best SuperLearner candidate: ", best_settings$candidate_id)
+message("Best Aim-1 candidate: ", best_settings$candidate_id)
+message(
+  "Selected learner: ", best_settings$selected_learner,
+  " | retain_ensemble=", best_settings$retain_ensemble
+)
+message(
+  "Selected ROC-AUC: ", signif(best_settings$selected_roc_auc, 4),
+  " | PR-AUC: ", signif(best_settings$selected_pr_auc, 4)
+)
 message(
   "Best F1 threshold: ", signif(best_settings$threshold, 4),
   " | F1: ", signif(best_settings$f1, 4),
@@ -821,23 +1068,43 @@ message(
 )
 
 
-#### 4. Fit Optimized SuperLearner On Full Training Dataset ####
+#### 4. Fit Selected Aim-1 Model On Full Training Dataset ####
 
 if (!file.exists(SL_FIT_RDS) || OVERWRITE_FINAL_MODEL) {
   best_candidate_index <- match(best_settings$candidate_id, SL_TUNING_GRID$candidate_id)
   best_candidate <- candidate_from_grid(best_candidate_index)
   full_obs_weights <- make_observation_weights(dataset2[[OUTCOME_COLUMN]])
+  retain_ensemble <- isTRUE(as.logical(best_settings$retain_ensemble))
 
-  message("Fitting final optimized SuperLearner on the full training dataset...")
-  final_sl_model <- fit_superlearner_model(
-    X = dataset2[, predictor_names, drop = FALSE],
-    y = dataset2[[OUTCOME_COLUMN]],
-    candidate = best_candidate,
-    obs_weights = full_obs_weights
-  )
+  if (retain_ensemble) {
+    message("Fitting final SuperLearner ensemble on the full training dataset...")
+    final_sl_model <- fit_superlearner_model(
+      X = dataset2[, predictor_names, drop = FALSE],
+      y = dataset2[[OUTCOME_COLUMN]],
+      candidate = best_candidate,
+      obs_weights = full_obs_weights
+    )
+    discrete_fit <- NULL
+  } else {
+    message(
+      "Ensemble did not beat best base learner; fitting discrete winner: ",
+      best_settings$selected_learner
+    )
+    final_sl_model <- NULL
+    discrete_fit <- fit_discrete_base_learner(
+      learner_name = as.character(best_settings$selected_learner),
+      X = dataset2[, predictor_names, drop = FALSE],
+      y = dataset2[[OUTCOME_COLUMN]],
+      candidate = best_candidate,
+      obs_weights = full_obs_weights
+    )
+  }
 
   model_object <- list(
     model = final_sl_model,
+    discrete_fit = discrete_fit,
+    retain_ensemble = retain_ensemble,
+    selected_learner = as.character(best_settings$selected_learner),
     predictor_names = predictor_names,
     imputation_values = imputation_values,
     tuning_results = tuning_results,
@@ -848,10 +1115,10 @@ if (!file.exists(SL_FIT_RDS) || OVERWRITE_FINAL_MODEL) {
     created_at = Sys.time()
   )
   saveRDS(model_object, SL_FIT_RDS)
-  message("Saved final SuperLearner model: ", SL_FIT_RDS)
+  message("Saved final Aim-1 model: ", SL_FIT_RDS)
 } else {
   model_object <- readRDS(SL_FIT_RDS)
-  message("Loaded cached final SuperLearner model: ", SL_FIT_RDS)
+  message("Loaded cached final Aim-1 model: ", SL_FIT_RDS)
 }
 
 

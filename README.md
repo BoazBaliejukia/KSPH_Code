@@ -126,11 +126,23 @@ Knit the email-friendly HTML report:
 rmarkdown::render("R_python_code/04b_interactive_prediction_report_email.Rmd")
 ```
 
-### 5. SuperLearner Prototype
+### 5. SuperLearner Aim-1 Ensemble (GBM + RF + SVM)
 
 ```r
 source("R_python_code/05_train_predict_SuperLearner_CV.R")
 ```
+
+Requires `data/dataset2.csv` and `data/prediction_grid_covariates_2020_2025.csv`.
+
+This script fits the protocol Aim-1 library:
+
+- `SL.aim1_gbm` (Bernoulli GBM)
+- `SL.aim1_rf` (classification random forest)
+- `SL.aim1_svm` (`kernlab` C-svc with probabilities)
+
+Outer stratified CV scores the SuperLearner stack and each base learner. The stack is **retained only if its ROC-AUC beats the best single learner**; otherwise the discrete winner is used for final maps. Outputs land under `models/superlearner_cv/` and `outputs/predictions/superlearner_cv/`.
+
+`03_train_predict_brt_simple.R` remains the BRT baseline path.
 
 ## Core Covariates
 
